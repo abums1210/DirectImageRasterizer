@@ -649,6 +649,218 @@ static void GetSvgDimensions(const std::string& xmlContent, uint32_t& outWidth, 
     outHeight = static_cast<uint32_t>(ceilf(parsedH));
 }
 
+std::string DirectImageRasterizer::GetCacheFilePath(const char* filePath, uint32_t width, uint32_t height) {
+    size_t lastSlash;
+    std::string pathStr, dir, name, cacheDir, cacheFile;
+
+    pathStr = filePath ? filePath : "";
+    lastSlash = pathStr.find_last_of("\\/");
+    if (lastSlash != std::string::npos) {
+        dir = pathStr.substr(0, lastSlash);
+        name = pathStr.substr(lastSlash + 1);
+    } else {
+        dir = ".";
+        name = pathStr;
+    }
+
+    cacheDir = dir + "\\.mipcache";
+    CreateDirectoryA(cacheDir.c_str(), nullptr);
+
+    cacheFile = cacheDir + "\\" + name + "_" + std::to_string(width) + "x" + std::to_string(height) + ".mipmap";
+    return cacheFile;
+}
+
+RwTexture* DirectImageRasterizer::TryLoadFromMipCache(const char* filePath, const char* cachePath, uint32_t targetW, uint32_t targetH, bool generateMipmaps, uint32_t mipLevels) {
+    WIN32_FILE_ATTRIBUTE_DATA srcAttr;
+    std::ifstream file;
+    MipmapCacheHeader header;
+    uint64_t srcSize;
+    uint32_t level, mipW, mipH, expectedDataSize, row, rowBytes;
+    RwInt32 dstStride;
+    RwRaster* raster;
+    RwTexture* texture;
+    RwUInt8 *pixels, *dstRow;
+    bool readFailed;
+
+    raster = nullptr;
+    texture = nullptr;
+    pixels = nullptr;
+    dstRow = nullptr;
+    srcSize = 0;
+    level = 0;
+    mipW = 0;
+    mipH = 0;
+    expectedDataSize = 0;
+    row = 0;
+    rowBytes = 0;
+    dstStride = 0;
+    readFailed = false;
+
+    if (!filePath || !cachePath || targetW == 0 || targetH == 0) return nullptr;
+
+    if (!GetFileAttributesExA(filePath, GetFileExInfoStandard, &srcAttr)) return nullptr;
+    srcSize = (static_cast<uint64_t>(srcAttr.nFileSizeHigh) << 32) | srcAttr.nFileSizeLow;
+
+    file.open(cachePath, std::ios::binary);
+    if (!file.is_open()) return nullptr;
+
+    file.read(reinterpret_cast<char*>(&header), sizeof(header));
+    if (!file) return nullptr;
+
+    if (header.magic != 0x4D495043 || header.version != 1) return nullptr;
+    if (header.width != targetW || header.height != targetH) return nullptr;
+    if (header.sourceLastWrite.dwLowDateTime != srcAttr.ftLastWriteTime.dwLowDateTime ||
+        header.sourceLastWrite.dwHighDateTime != srcAttr.ftLastWriteTime.dwHighDateTime) return nullptr;
+    if (header.sourceFileSize != srcSize) return nullptr;
+    if (header.numMipLevels == 0) return nullptr;
+
+    if (generateMipmaps && header.numMipLevels <= 1 && (targetW > 1 || targetH > 1)) return nullptr;
+    if (!generateMipmaps && header.numMipLevels > 1) return nullptr;
+
+    expectedDataSize = 0;
+    for (level = 0; level < header.numMipLevels; level++) {
+        mipW = header.width >> level;
+        if (mipW < 1) mipW = 1;
+        mipH = header.height >> level;
+        if (mipH < 1) mipH = 1;
+        expectedDataSize += mipW * mipH * 4;
+    }
+    if (header.dataSize != expectedDataSize) return nullptr;
+
+    raster = RwRasterCreate(header.width, header.height, 32, header.rasterFlags);
+    if (!raster) return nullptr;
+
+    readFailed = false;
+    for (level = 0; level < header.numMipLevels; level++) {
+        mipW = header.width >> level;
+        if (mipW < 1) mipW = 1;
+        mipH = header.height >> level;
+        if (mipH < 1) mipH = 1;
+        rowBytes = mipW * 4;
+
+        pixels = RwRasterLock(raster, static_cast<RwUInt8>(level), rwRASTERLOCKWRITE);
+        if (!pixels) {
+            readFailed = true;
+            break;
+        }
+
+        dstStride = raster->stride;
+        if (dstStride == static_cast<RwInt32>(rowBytes)) {
+            file.read(reinterpret_cast<char*>(pixels), rowBytes * mipH);
+            if (!file) readFailed = true;
+        } else {
+            for (row = 0; row < mipH; row++) {
+                dstRow = pixels + row * dstStride;
+                file.read(reinterpret_cast<char*>(dstRow), rowBytes);
+                if (!file) {
+                    readFailed = true;
+                    break;
+                }
+            }
+        }
+
+        RwRasterUnlock(raster);
+        if (readFailed) break;
+    }
+
+    if (readFailed) {
+        RwRasterDestroy(raster);
+        return nullptr;
+    }
+
+    texture = RwTextureCreate(raster);
+    if (texture) {
+        RwTextureSetFilterMode(texture, (header.numMipLevels <= 1) ? rwFILTERLINEAR : rwFILTERLINEARMIPLINEAR);
+    }
+    return texture;
+}
+
+bool DirectImageRasterizer::SaveToMipCache(const char* cachePath, const char* filePath, RwRaster* raster, uint32_t width, uint32_t height, uint32_t numMipLevels, uint32_t rasterFlags) {
+    WIN32_FILE_ATTRIBUTE_DATA srcAttr;
+    std::ofstream file;
+    MipmapCacheHeader header;
+    uint32_t level, mipW, mipH, row, rowBytes, totalDataSize;
+    RwInt32 srcStride;
+    RwUInt8 *pixels, *srcRow;
+
+    pixels = nullptr;
+    srcRow = nullptr;
+    level = 0;
+    mipW = 0;
+    mipH = 0;
+    row = 0;
+    rowBytes = 0;
+    totalDataSize = 0;
+    srcStride = 0;
+
+    if (!raster || !cachePath || !filePath || width == 0 || height == 0 || numMipLevels == 0) return false;
+    if (!GetFileAttributesExA(filePath, GetFileExInfoStandard, &srcAttr)) return false;
+
+    totalDataSize = 0;
+    for (level = 0; level < numMipLevels; level++) {
+        mipW = width >> level;
+        if (mipW < 1) mipW = 1;
+        mipH = height >> level;
+        if (mipH < 1) mipH = 1;
+        totalDataSize += mipW * mipH * 4;
+    }
+
+    header.magic = 0x4D495043; // 'MIPC'
+    header.version = 1;
+    header.sourceLastWrite = srcAttr.ftLastWriteTime;
+    header.sourceFileSize = (static_cast<uint64_t>(srcAttr.nFileSizeHigh) << 32) | srcAttr.nFileSizeLow;
+    header.width = width;
+    header.height = height;
+    header.numMipLevels = numMipLevels;
+    header.rasterFlags = rasterFlags;
+    header.dataSize = totalDataSize;
+
+    file.open(cachePath, std::ios::binary | std::ios::trunc);
+    if (!file.is_open()) return false;
+
+    file.write(reinterpret_cast<const char*>(&header), sizeof(header));
+    if (!file) {
+        file.close();
+        DeleteFileA(cachePath);
+        return false;
+    }
+
+    for (level = 0; level < numMipLevels; level++) {
+        mipW = width >> level;
+        if (mipW < 1) mipW = 1;
+        mipH = height >> level;
+        if (mipH < 1) mipH = 1;
+        rowBytes = mipW * 4;
+
+        pixels = RwRasterLock(raster, static_cast<RwUInt8>(level), rwRASTERLOCKREAD);
+        if (!pixels) {
+            file.close();
+            DeleteFileA(cachePath);
+            return false;
+        }
+
+        srcStride = raster->stride;
+        if (srcStride == static_cast<RwInt32>(rowBytes)) {
+            file.write(reinterpret_cast<const char*>(pixels), rowBytes * mipH);
+        } else {
+            for (row = 0; row < mipH; row++) {
+                srcRow = pixels + row * srcStride;
+                file.write(reinterpret_cast<const char*>(srcRow), rowBytes);
+            }
+        }
+
+        RwRasterUnlock(raster);
+        if (!file) {
+            file.close();
+            DeleteFileA(cachePath);
+            return false;
+        }
+    }
+
+    file.close();
+    return true;
+}
+
 RwTexture* DirectImageRasterizer::LoadSVGToRwTexture(const char* filePath, uint32_t width, uint32_t height, bool generateMipmaps, uint32_t mipLevels) {
     HRESULT hr;
     D3D_FEATURE_LEVEL featureLevels[2];
@@ -669,7 +881,7 @@ RwTexture* DirectImageRasterizer::LoadSVGToRwTexture(const char* filePath, uint3
     float scaleX, scaleY;
     bool mipFailed;
     RwInt32 rasterFlags;
-    std::string xmlContent;
+    std::string xmlContent, cachePath;
     std::vector<FilteredNodeInfo> filterInfos;
     std::vector<FilteredNode> filteredNodes;
     size_t k;
@@ -695,11 +907,20 @@ RwTexture* DirectImageRasterizer::LoadSVGToRwTexture(const char* filePath, uint3
         return nullptr;
     }
 
+    targetW = width;
+    targetH = height;
+
+    if (targetW > 0 && targetH > 0) {
+        cachePath = GetCacheFilePath(filePath, targetW, targetH);
+        texture = TryLoadFromMipCache(filePath, cachePath.c_str(), targetW, targetH, generateMipmaps, mipLevels);
+        if (texture) {
+            return texture;
+        }
+    }
+
     xmlContent = ReadFileToString(filePath);
     if (xmlContent.empty()) return nullptr;
 
-    targetW = width;
-    targetH = height;
     if (targetW == 0 || targetH == 0) {
         GetSvgDimensions(xmlContent, autoW, autoH);
         if (targetW == 0) targetW = autoW;
@@ -708,6 +929,14 @@ RwTexture* DirectImageRasterizer::LoadSVGToRwTexture(const char* filePath, uint3
 
     if (targetW == 0 || targetH == 0) {
         return nullptr;
+    }
+
+    if (cachePath.empty()) {
+        cachePath = GetCacheFilePath(filePath, targetW, targetH);
+        texture = TryLoadFromMipCache(filePath, cachePath.c_str(), targetW, targetH, generateMipmaps, mipLevels);
+        if (texture) {
+            return texture;
+        }
     }
 
     PreprocessPaintOrder(xmlContent);
@@ -812,6 +1041,10 @@ RwTexture* DirectImageRasterizer::LoadSVGToRwTexture(const char* filePath, uint3
         }
     }
 
+    if (!mipFailed && !cachePath.empty()) {
+        SaveToMipCache(cachePath.c_str(), filePath, raster, targetW, targetH, numMipLevels, rasterFlags);
+    }
+
     texture = RwTextureCreate(raster);
     if (texture) {
         RwTextureSetFilterMode(texture, (mipFailed || numMipLevels <= 1) ? rwFILTERLINEAR : rwFILTERLINEARMIPLINEAR);
@@ -856,6 +1089,7 @@ RwTexture* DirectImageRasterizer::LoadPNGToRwTexture(const char* filePath, uint3
     bool mipFailed;
     wchar_t wFilePath[MAX_PATH];
     WICRect rect;
+    std::string cachePath;
 
     factory = nullptr;
     currentSource = nullptr;
@@ -880,6 +1114,17 @@ RwTexture* DirectImageRasterizer::LoadPNGToRwTexture(const char* filePath, uint3
 
     if (!filePath || filePath[0] == '\0') {
         return nullptr;
+    }
+
+    targetW = width;
+    targetH = height;
+
+    if (targetW > 0 && targetH > 0) {
+        cachePath = GetCacheFilePath(filePath, targetW, targetH);
+        texture = TryLoadFromMipCache(filePath, cachePath.c_str(), targetW, targetH, generateMipmaps, mipLevels);
+        if (texture) {
+            return texture;
+        }
     }
 
     if (MultiByteToWideChar(CP_UTF8, 0, filePath, -1, wFilePath, MAX_PATH) == 0) {
@@ -908,6 +1153,14 @@ RwTexture* DirectImageRasterizer::LoadPNGToRwTexture(const char* filePath, uint3
 
     targetW = (width > 0) ? width : origW;
     targetH = (height > 0) ? height : origH;
+
+    if (cachePath.empty()) {
+        cachePath = GetCacheFilePath(filePath, targetW, targetH);
+        texture = TryLoadFromMipCache(filePath, cachePath.c_str(), targetW, targetH, generateMipmaps, mipLevels);
+        if (texture) {
+            return texture;
+        }
+    }
 
     hr = factory->CreateFormatConverter(&converter);
     if (FAILED(hr)) return nullptr;
@@ -998,6 +1251,10 @@ RwTexture* DirectImageRasterizer::LoadPNGToRwTexture(const char* filePath, uint3
 
         RwRasterUnlock(raster);
         if (mipFailed) break;
+    }
+
+    if (!mipFailed && !cachePath.empty()) {
+        SaveToMipCache(cachePath.c_str(), filePath, raster, targetW, targetH, numMipLevels, rasterFlags);
     }
 
     texture = RwTextureCreate(raster);
