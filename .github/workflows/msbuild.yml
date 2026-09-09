@@ -25,7 +25,7 @@ jobs:
     - name: Checkout Plugin-SDK
       uses: actions/checkout@v6
       with:
-        repository: 'DK22Pac/plugin-sdk'
+        repository: 'abums1210/plugin-sdk'
         path: 'plugin-sdk'
         submodules: recursive
 
