@@ -40,8 +40,8 @@ public:
     static void EnsureLoaded() {
         if (!IsLoaded()) {
             MessageBoxA(nullptr,
-                "DirectImageRasterizer plugin is required but could not be loaded.\n\n"
-                "Please ensure 'DirectImageRasterizer.VC.asi' (or 'DirectImageRasterizer.asi') is installed in your game's scripts folder.",
+                "DirectImageRasterizer plugin is required but could not be found.\n\n"
+                "Please reinstall or ensure 'DirectImageRasterizer' is placed in your game's scripts folder.",
                 "Missing Dependency Error",
                 MB_ICONERROR | MB_OK);
             ExitProcess(1);
